@@ -207,6 +207,7 @@ mod tests {
                 last_fired: None,
                 last_error: Some("内部注入细节".to_owned()),
                 last_focus: None,
+                active_profile: None,
             },
         };
         let send_input = SendInputSnapshot {

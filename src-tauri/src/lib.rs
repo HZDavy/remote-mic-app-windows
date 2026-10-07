@@ -1,4 +1,6 @@
-use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
+use sayall_windows::button_mapping::{
+    ButtonEdgeCallback, ButtonGestureCallback, ButtonProfileCallback,
+};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::rc003_bridge::{BridgePhase, BridgeSnapshot};
 use sayall_windows::send_input::{
@@ -2076,16 +2078,20 @@ fn create_platform() -> Arc<dyn PlatformRuntime> {
     Arc::new(WindowsPlatform::default())
 }
 
-/// 语义按键边沿/手势 → Tauri 事件（button-edge / button-gesture）。
+/// 语义按键边沿/手势/profile 切换 → Tauri 事件（button-edge / button-gesture / mapping-profile-changed）。
 /// 引擎线程回调，Emitter::emit 线程安全。
 fn register_button_events(platform: &Arc<dyn PlatformRuntime>, app: tauri::AppHandle) {
     let edge_app = app.clone();
     platform.subscribe_button_edges(Arc::new(move |edge| {
         let _ = edge_app.emit("button-edge", &edge);
     }));
-    let gesture_app = app;
+    let gesture_app = app.clone();
     platform.subscribe_button_gestures(Arc::new(move |gesture| {
         let _ = gesture_app.emit("button-gesture", &gesture);
+    }));
+    let profile_app = app;
+    platform.subscribe_profile_changed(Arc::new(move |active_profile: Option<String>| {
+        let _ = profile_app.emit("mapping-profile-changed", &active_profile);
     }));
 }
 

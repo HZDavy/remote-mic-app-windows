@@ -85,6 +85,12 @@ pub trait PlatformRuntime: Debug + Send + Sync {
         &self,
         callback: sayall_windows::button_mapping::ButtonGestureCallback,
     );
+    /// 订阅前台应用 profile 切换（`Some(profile名)`=命中，`None`=回落基础映射）。
+    /// 引擎前台观测线程回调，`Emitter::emit` 线程安全。
+    fn subscribe_profile_changed(
+        &self,
+        callback: sayall_windows::button_mapping::ButtonProfileCallback,
+    );
 
     /// 退出前优雅关闭（2026-09-16）：关闭 BLE 会话并在**有界时间**内等待其完成
     /// （`ble_session_cleanup` 落盘）后才返回。
@@ -260,6 +266,13 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::subscribe_button_gestures(self, callback)
     }
 
+    fn subscribe_profile_changed(
+        &self,
+        callback: sayall_windows::button_mapping::ButtonProfileCallback,
+    ) {
+        WindowsPlatform::subscribe_profile_changed(self, callback)
+    }
+
     fn set_enhanced_capture_enabled(&self, enabled: bool) {
         // 必须是**纯委托**：开关的平台侧语义（key_gate enabled 位、原子量 store、
         // 动态目标下发）全部收敛在 WindowsPlatform::set_enhanced_capture_enabled
@@ -279,7 +292,9 @@ impl PlatformRuntime for WindowsPlatform {
 mod simulation {
     use super::*;
     use sayall_core::{AtvvCapabilities, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
-    use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
+    use sayall_windows::button_mapping::{
+        ButtonEdgeCallback, ButtonGestureCallback, ButtonProfileCallback,
+    };
     use sayall_windows::hardware_script::{
         button_edges_for_hid_report, decode_hex, HardwareSignalEvent, HardwareSignalScript,
     };
@@ -332,6 +347,7 @@ mod simulation {
         state: Mutex<SimulationState>,
         edge_sinks: Mutex<Vec<ButtonEdgeCallback>>,
         gesture_sinks: Mutex<Vec<ButtonGestureCallback>>,
+        profile_sinks: Mutex<Vec<ButtonProfileCallback>>,
         voice_hold_hotkey: Mutex<Option<KeyChord>>,
         voice_input_tool: Mutex<Option<VoiceInputTool>>,
         /// 语音增益（dB，0–24）：与真实平台同形，仿真会话也走
@@ -906,6 +922,7 @@ mod simulation {
                 last_fired: None,
                 last_error: None,
                 last_focus: None,
+                active_profile: None,
             }
         }
 
@@ -922,6 +939,13 @@ mod simulation {
             callback: sayall_windows::button_mapping::ButtonGestureCallback,
         ) {
             lock(&self.gesture_sinks).push(callback);
+        }
+
+        fn subscribe_profile_changed(
+            &self,
+            callback: sayall_windows::button_mapping::ButtonProfileCallback,
+        ) {
+            lock(&self.profile_sinks).push(callback);
         }
 
         fn start_hardware_script_replay(self: Arc<Self>, path: std::path::PathBuf) {
