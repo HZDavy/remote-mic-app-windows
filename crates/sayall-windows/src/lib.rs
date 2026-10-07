@@ -32,6 +32,8 @@ pub mod focus_service;
 /// Windows UI Automation 后端（MTA 工作线程；非 Windows 平台不参与编译）。
 #[cfg(windows)]
 pub mod focus_windows;
+/// 前台窗口观测（#213「按前台应用切换快捷键映射方案」的检测基座）。
+pub mod foreground;
 #[cfg(windows)]
 pub mod graceful_exit;
 // 硬件信号脚本（仿真回放用；见模块注释）：解析模拟器导出的信号脚本。
@@ -811,6 +813,11 @@ impl WindowsPlatform {
     /// 订阅已触发手势（单击/双击/长按反馈）。
     pub fn subscribe_button_gestures(&self, callback: button_mapping::ButtonGestureCallback) {
         self.button_mapping.subscribe_button_gestures(callback);
+    }
+
+    /// 订阅前台应用 profile 切换（`Some(profile名)`=命中，`None`=回落基础映射）。
+    pub fn subscribe_profile_changed(&self, callback: button_mapping::ButtonProfileCallback) {
+        self.button_mapping.on_profile_changed(callback);
     }
 
     pub fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError> {
