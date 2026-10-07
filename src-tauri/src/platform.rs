@@ -52,6 +52,22 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     ) -> Result<sayall_windows::focus::RecordedFocusTarget, PlatformError>;
     /// 预设应用清单（含安装状态）。
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
+    /// 通用元素导航（#214）：扫描前台进程可交互元素快照（overlay 初次绘制 / 诊断）。
+    ///
+    /// 默认返回空列表（仿真与不支持导航的平台走到这里）。
+    fn nav_scan(&self) -> Result<Vec<sayall_windows::nav::NavElement>, PlatformError> {
+        Ok(Vec::new())
+    }
+    /// 通用元素导航（#214）：以 `cursor` 为原点向 `dir` 移动高亮并激活。
+    ///
+    /// 默认返回 `Unavailable`（仿真与不支持导航的平台）。
+    fn nav_move(
+        &self,
+        cursor: &sayall_windows::nav::NormalizedRect,
+        dir: sayall_windows::nav::NavDir,
+    ) -> sayall_windows::nav::NavMoveOutcome {
+        sayall_windows::nav::NavMoveOutcome::Unavailable
+    }
     /// 仿真旅程是否跳过「外部入口（官网 / GitHub）」这两步。
     ///
     /// 它们经 opener 打开系统默认浏览器：CI 需要真实执行以守住 capability 白名单，
@@ -216,6 +232,18 @@ impl PlatformRuntime for WindowsPlatform {
 
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
         sayall_windows::app_launcher::probe_preset_apps()
+    }
+
+    fn nav_scan(&self) -> Result<Vec<sayall_windows::nav::NavElement>, PlatformError> {
+        WindowsPlatform::nav_scan(self)
+    }
+
+    fn nav_move(
+        &self,
+        cursor: &sayall_windows::nav::NormalizedRect,
+        dir: sayall_windows::nav::NavDir,
+    ) -> sayall_windows::nav::NavMoveOutcome {
+        WindowsPlatform::nav_move(self, cursor, dir)
     }
 
     fn launch_app(&self, target: &str) -> Result<(), PlatformError> {

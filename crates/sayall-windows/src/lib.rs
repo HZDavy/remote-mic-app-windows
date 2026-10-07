@@ -36,6 +36,9 @@ pub mod focus_windows;
 pub mod foreground;
 #[cfg(windows)]
 pub mod graceful_exit;
+/// 通用屏幕元素导航（#214）：方向最近邻选点的纯逻辑（跨平台可单测）。
+pub mod nav;
+#[cfg(windows)]
 // 硬件信号脚本（仿真回放用；见模块注释）：解析模拟器导出的信号脚本。
 // 无副作用、不进入基础路径，仅仿真平台消费。
 pub mod hardware_script;
@@ -820,6 +823,45 @@ impl WindowsPlatform {
         self.button_mapping.on_profile_changed(callback);
     }
 
+    // ---------- 通用元素导航（#214） ----------
+
+    /// 可交互元素导航：扫描当前前台应用之外的前台进程窗口。
+    ///
+    /// 只在 Windows 上可用；其余平台返回 `NavMoveResult::Failed`（见下方判断）。
+    /// 返回该进程可交互元素快照（overlay 初次绘制 / 诊断）。
+    pub fn nav_scan(&self) -> Result<Vec<nav::NavElement>, PlatformError> {
+        #[cfg(windows)]
+        {
+            let Some(pid) = focus_windows::nav_foreground_pid() else {
+                return Err(PlatformError::WorkerUnavailable);
+            };
+            focus_windows::nav_scan(pid).map_err(PlatformError::from_focus_failure)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 可交互元素导航：向 `dir` 移动高亮并激活（Invoke 优先 / SetFocus 回退）。
+    pub fn nav_move(
+        &self,
+        cursor: &nav::NormalizedRect,
+        dir: nav::NavDir,
+    ) -> nav::NavMoveOutcome {
+        #[cfg(windows)]
+        {
+            let Some(pid) = focus_windows::nav_foreground_pid() else {
+                return nav::NavMoveOutcome::Unavailable;
+            };
+            focus_windows::nav_move(pid, cursor, dir).into_outcome()
+        }
+        #[cfg(not(windows))]
+        {
+            nav::NavMoveOutcome::Unavailable
+        }
+    }
+
     pub fn scan_paired_remotes(&self) -> Result<Vec<PairedRemote>, PlatformError> {
         scan_paired_remotes()
     }
@@ -1170,6 +1212,13 @@ impl PlatformError {
             | Self::GattAccessDenied(message) => Self::Gatt(message),
             other => other,
         }
+    }
+
+    /// 将 UIA 聚焦失败原因转成平台错误（供导航/聚焦命令映射到前端契约）。
+    pub fn from_focus_failure(failure: focus_service::FocusFailure) -> Self {
+        // 平台错误桶没有代表 UIA 语义的专用变体，统一归入 `SendInput(String)`，
+        // 用 `as_str()` 的 snake_case 码保留结构化原因。
+        Self::SendInput(format!("focus:{}", failure.as_str()))
     }
 }
 

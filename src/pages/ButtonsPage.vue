@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import RegisteredAppsDialog from "../components/RegisteredAppsDialog.vue";
 import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
+import ElementNavOverlay from "../components/ElementNavOverlay.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import { parseManualChord, ManualKeyError } from "../lib/manual-keys";
@@ -1700,6 +1701,8 @@ async function toggleRc003Capture() {
 }
 
 const showCaptureConfirm = ref(false);
+/** 元素导航模式（#214）：开启后方向键/OK 在导航 overlay 上走 UIA 遍历而非原生键。 */
+const navModeActive = ref(false);
 
 function confirmCaptureDialog(): void {
   showCaptureConfirm.value = false;
@@ -2480,6 +2483,15 @@ onUnmounted(() => {
         <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
           恢复默认
         </button>
+        <button
+          class="secondary-button nav-mode-toggle"
+          type="button"
+          :disabled="busy"
+          :aria-pressed="navModeActive"
+          @click="navModeActive = !navModeActive"
+        >
+          {{ navModeActive ? "退出元素导航" : "元素导航…" }}
+        </button>
       </div>
     </footer>
 
@@ -2634,6 +2646,7 @@ onUnmounted(() => {
     <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
     <RegisteredAppsDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="busy" :save-error="appPickerError" @close="appPickerOpen = false" @add="addScannedApps" />
     <EnhancedCaptureConfirmDialog v-if="showCaptureConfirm" @confirm="confirmCaptureDialog" @close="closeCaptureDialog" />
+    <ElementNavOverlay v-if="navModeActive" :active="navModeActive" @exit="navModeActive = false" />
   </section>
 </template>
 

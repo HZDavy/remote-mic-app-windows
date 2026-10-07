@@ -200,6 +200,41 @@ export interface NormalizedRect {
 }
 
 /**
+ * 通用屏幕元素导航方向（对齐 crates/sayall-windows/src/nav.rs `NavDir`）。
+ * 只有主方向（上/下/左/右）参与遍历，不作为注入动作。
+ */
+export type NavDir = "up" | "down" | "left" | "right";
+
+/** UIA 候选元素类型（对齐 nav.rs `NavElementType`）；`prefer_invoke` 的判定基础。 */
+export type NavElementType =
+  | "button"
+  | "list_item"
+  | "link"
+  | "menu_item"
+  | "check_box"
+  | "radio_button"
+  | "tree_item"
+  | "tab_item"
+  | "other";
+
+/** 导航扫描得到的候选元素（对齐 nav.rs `NavElement`）。 */
+export interface NavElement {
+  rect: NormalizedRect;
+  etype: NavElementType;
+}
+
+/**
+ * 一次导航移动的结果（对齐 nav.rs `NavMoveOutcome` 的 internally-tagged serde 契约）。
+ * `moved` 携带可被键盘可触发的元素索引与矩形（供 UI 画高亮框）。
+ */
+export type NavMoveOutcome =
+  | { type: "moved"; index: number; activated: boolean; rect: NormalizedRect }
+  | { type: "no_element" }
+  | { type: "target_exited" }
+  | { type: "failed"; reason: string }
+  | { type: "unavailable" };
+
+/**
  * 用户记录的输入框语义特征（不含任何输入内容）。
  *
  * `name` / `windowTitle` 属本地配置数据（可能含文档名等个人化信息），只存本地
@@ -1024,6 +1059,26 @@ export async function subscribeProfileChanged(
   return () => {
     void unlisten();
   };
+}
+
+/** 扫描当前前台窗口的通用可导航元素；浏览器预览下返回空列表。 */
+export async function navScan(): Promise<NavElement[]> {
+  if (!isTauriRuntime()) return [];
+  const elements = await invoke<NavElement[]>("nav_scan");
+  return elements ?? [];
+}
+
+/**
+ * 在候选元素间沿 `dir` 移动（UIA 遍历 + 可选 Invoke；非键注入）。
+ * `cursor` 为当前高亮矩形的归一化坐标；返回结果供 UI 画新框。
+ */
+export async function navMove(
+  cursor: NormalizedRect,
+  dir: NavDir,
+): Promise<NavMoveOutcome | null> {
+  if (!isTauriRuntime()) return null;
+  const outcome = await invoke<NavMoveOutcome>("nav_move", { cursor, dir });
+  return outcome ?? null;
 }
 
 /** 开始 OS 级快捷键录入；返回录入开始时仍被按住的键（preheld）。

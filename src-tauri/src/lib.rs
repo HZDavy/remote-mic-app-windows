@@ -1345,6 +1345,30 @@ async fn test_app_focus(target: String, state: tauri::State<'_, AppState>) -> Re
         .map_err(|error| error.to_string())
 }
 
+/// 通用元素导航（#214）：返回当前前台进程的可交互元素快照（overlay 初次绘制 / 诊断）。
+#[tauri::command]
+async fn nav_scan(state: tauri::State<'_, AppState>) -> Result<Vec<sayall_windows::nav::NavElement>, String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.nav_scan())
+        .await
+        .map_err(|error| format!("导航扫描任务失败：{error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// 通用元素导航（#214）：以 `cursor` 为原点向 `dir` 移动高亮并激活
+/// （Invoke 优先 / SetFocus 回退，读回确认）。
+#[tauri::command]
+async fn nav_move(
+    cursor: sayall_windows::nav::NormalizedRect,
+    dir: sayall_windows::nav::NavDir,
+    state: tauri::State<'_, AppState>,
+) -> Result<sayall_windows::nav::NavMoveOutcome, String> {
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || platform.nav_move(&cursor, dir))
+        .await
+        .map_err(|error| format!("导航移动任务失败：{error}"))
+}
+
 /// 原生文件选择器：选择自定义应用（.exe/.lnk）。用户取消返回 null。
 #[tauri::command]
 fn pick_custom_app() -> Option<sayall_windows::app_launcher::CustomAppPick> {
@@ -1352,8 +1376,7 @@ fn pick_custom_app() -> Option<sayall_windows::app_launcher::CustomAppPick> {
 }
 
 #[tauri::command]
-async fn scan_registered_apps() -> Result<Vec<sayall_windows::app_launcher::CustomAppPick>, String>
-{
+async fn scan_registered_apps() -> Result<Vec<sayall_windows::app_launcher::CustomAppPick>, String> {
     tauri::async_runtime::spawn_blocking(sayall_windows::registered_apps::scan_registered_apps)
         .await
         .map_err(|error| format!("应用扫描任务失败：{error}"))?
@@ -2804,6 +2827,8 @@ pub fn run() {
         test_button_mapping,
         learn_focus_target,
         test_app_focus,
+        nav_scan,
+        nav_move,
         list_preset_apps,
         pick_custom_app,
         scan_registered_apps,
@@ -2866,6 +2891,8 @@ pub fn run() {
         test_button_mapping,
         learn_focus_target,
         test_app_focus,
+        nav_scan,
+        nav_move,
         list_preset_apps,
         pick_custom_app,
         scan_registered_apps,

@@ -35,8 +35,12 @@ mod imp {
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationElementArray,
-        IUIAutomationValuePattern, TreeScope_Descendants, UIA_DocumentControlTypeId,
-        UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_TextPatternId, UIA_ValuePatternId,
+        IUIAutomationInvokePattern, IUIAutomationValuePattern, TreeScope_Descendants,
+        UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_DocumentControlTypeId,
+        UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_HyperlinkControlTypeId,
+        UIA_InvokePatternId, UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId,
+        UIA_RadioButtonControlTypeId, UIA_TabItemControlTypeId, UIA_TextPatternId,
+        UIA_TreeItemControlTypeId, UIA_ValuePatternId,
     };
     use windows::Win32::UI::HiDpi::{
         GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
@@ -343,6 +347,230 @@ mod imp {
         Ok(ScanResult { candidates })
     }
 
+    // ---------- 通用元素导航（#214） ----------
+
+    /// 把 UIA control type 放宽为可交互 nav 元素类型；不关心的类型返回 `None`
+    /// （不纳入候选）。对应 issue「把候选门槛放宽为可交互元素（Button/List/
+    /// Item/Link 等），保留既有过滤」。
+    fn nav_element_type(
+        control_type: windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID,
+    ) -> Option<crate::nav::NavElementType> {
+        use windows::Win32::UI::Accessibility as a11y;
+        let etype = match control_type {
+            a11y::UIA_ButtonControlTypeId => crate::nav::NavElementType::Button,
+            a11y::UIA_ListItemControlTypeId => crate::nav::NavElementType::ListItem,
+            a11y::UIA_HyperlinkControlTypeId => crate::nav::NavElementType::Link,
+            a11y::UIA_MenuItemControlTypeId => crate::nav::NavElementType::MenuItem,
+            a11y::UIA_CheckBoxControlTypeId => crate::nav::NavElementType::CheckBox,
+            a11y::UIA_RadioButtonControlTypeId => crate::nav::NavElementType::RadioButton,
+            a11y::UIA_TreeItemControlTypeId => crate::nav::NavElementType::TreeItem,
+            a11y::UIA_TabItemControlTypeId => crate::nav::NavElementType::TabItem,
+            _ => return None,
+        };
+        Some(etype)
+    }
+
+    /// nav 候选门槛（宽松）：元素可见、enabled、有合法矩形、属于可交互 control
+    /// type。不做进程注入；无 UIA 树时上层返回「无元素」。
+    fn nav_candidate(
+        element: &IUIAutomationElement,
+        control_type: windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID,
+        window_frame: Option<(f64, f64, f64, f64)>,
+    ) -> Option<crate::nav::NavElement> {
+        let etype = nav_element_type(control_type)?;
+        let enabled = unsafe { element.CurrentIsEnabled() }
+            .map(|flag| flag.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let rect = unsafe { element.CurrentBoundingRectangle() }.ok()?;
+        let bounds = sane_rect(&rect)?;
+        let normalized = crate::focus::NormalizedRect::from_bounds(Some(bounds), window_frame)?;
+        Some(crate::nav::NavElement { rect: normalized, etype })
+    }
+
+    /// 扫描目标进程当前窗口的可交互元素（同一 UIA 子树，顺序稳定）。
+    fn collect_nav_elements(
+        session: &Session,
+        hwnd: HWND,
+    ) -> Result<Vec<crate::nav::NavElement>, FocusFailure> {
+        let automation = &session.automation;
+        let root = unsafe { automation.ElementFromHandle(hwnd) }
+            .map_err(|_| FocusFailure::NotAccessible)?;
+        let condition =
+            unsafe { automation.CreateTrueCondition() }.map_err(|_| FocusFailure::NotAccessible)?;
+        let elements: IUIAutomationElementArray =
+            unsafe { root.FindAll(TreeScope_Descendants, &condition) }
+                .map_err(|_| FocusFailure::NotAccessible)?;
+        let count = unsafe { elements.Length() }.unwrap_or(0).max(0) as usize;
+        let window_frame = unsafe { root.CurrentBoundingRectangle() }
+            .ok()
+            .and_then(|rect| sane_rect(&rect));
+        let mut out = Vec::new();
+        for index in 0..count.min(MAX_TRAVERSAL_ELEMENTS) {
+            let Ok(element) = (unsafe { elements.GetElement(index as i32) }) else {
+                continue;
+            };
+            let Ok(control_type) = (unsafe { element.CurrentControlType() }) else {
+                continue;
+            };
+            if let Some(candidate) = nav_candidate(&element, control_type, window_frame) {
+                out.push(candidate);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 一次导航移动的结果（对 overlay / 诊断可见）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum NavMoveResult {
+        /// 已移动高亮到新元素并尝试激活。
+        Moved {
+            /// 命中元素序号（在扫描快照中的下标）。
+            index: usize,
+            /// 是否确认激活（Invoke 成功或 SetFocus 后元素持有焦点）。
+            activated: bool,
+            /// 命中元素的归一化矩形（overlay 画框用）。
+            rect: crate::nav::NormalizedRect,
+        },
+        /// 该方向没有可导航元素。
+        NoElement,
+        /// 目标进程已退出或无窗口。
+        TargetExited,
+        /// 无法访问 UIA 树。
+        Failed(FocusFailure),
+    }
+
+    impl NavMoveResult {
+        /// 转换为跨平台可序列化的 `nav::NavMoveOutcome`。
+        pub fn into_outcome(self) -> crate::nav::NavMoveOutcome {
+            use crate::nav::NavMoveOutcome;
+            match self {
+                Self::Moved {
+                    index,
+                    activated,
+                    rect,
+                } => NavMoveOutcome::Moved {
+                    index,
+                    activated,
+                    rect,
+                },
+                Self::NoElement => NavMoveOutcome::NoElement,
+                Self::TargetExited => NavMoveOutcome::TargetExited,
+                Self::Failed(reason) => NavMoveOutcome::Failed {
+                    reason: reason.as_str().into(),
+                },
+            }
+        }
+    }
+
+    /// 以 `cursor` 为原点向 `dir` 选最近元素并激活（Invoke 优先、SetFocus 回退，
+    /// 用 `CompareRuntimeIds` 读回确认），全程在同一 UIA 调用里完成避免索引漂移。
+    pub fn nav_move(
+        pid: u32,
+        cursor: &crate::nav::NormalizedRect,
+        dir: crate::nav::NavDir,
+    ) -> NavMoveResult {
+        if !process_alive(pid) {
+            return NavMoveResult::TargetExited;
+        }
+        let Some((hwnd, _)) = target_window(pid) else {
+            return NavMoveResult::TargetExited;
+        };
+        let raw = hwnd.0 as isize;
+        let cursor = cursor.clone();
+        let result = submit(move |session| {
+            let hwnd = hwnd_from_raw(raw);
+            let elements = match collect_nav_elements(session, hwnd) {
+                Ok(elements) => elements,
+                Err(reason) => return NavMoveResult::Failed(reason),
+            };
+            let Some(index) = crate::nav::pick_at(&cursor, dir, &elements) else {
+                return NavMoveResult::NoElement;
+            };
+            let automation = &session.automation;
+            let Ok(root) = (unsafe { automation.ElementFromHandle(hwnd) }) else {
+                return NavMoveResult::Failed(FocusFailure::NotAccessible);
+            };
+            let Ok(condition) = (unsafe { automation.CreateTrueCondition() }) else {
+                return NavMoveResult::Failed(FocusFailure::NotAccessible);
+            };
+            let Ok(array) = (unsafe { root.FindAll(TreeScope_Descendants, &condition) }) else {
+                return NavMoveResult::Failed(FocusFailure::NotAccessible);
+            };
+            let window_frame = unsafe { root.CurrentBoundingRectangle() }
+                .ok()
+                .and_then(|rect| sane_rect(&rect));
+            let mut seen = 0usize;
+            for element_index in 0..unsafe { array.Length() }.unwrap_or(0) {
+                let Ok(element) = (unsafe { array.GetElement(element_index) }) else {
+                    continue;
+                };
+                let Ok(control_type) = (unsafe { element.CurrentControlType() }) else {
+                    continue;
+                };
+                let Some(candidate) =
+                    nav_candidate(&element, control_type, window_frame)
+                else {
+                    continue;
+                };
+                if seen != index {
+                    seen += 1;
+                    continue;
+                }
+                let activated = invoke_or_focus(session, &element, candidate.etype);
+                return NavMoveResult::Moved {
+                    index,
+                    activated,
+                    rect: candidate.rect,
+                };
+            }
+            NavMoveResult::NoElement
+        });
+        result.unwrap_or(NavMoveResult::Failed(FocusFailure::NotAccessible))
+    }
+
+    /// 尝试激活元素：`prefer_invoke` 时优先 `Invoke`，否则/失败回退 `SetFocus`，
+    /// 最后用读回判定是否已激活。
+    fn invoke_or_focus(
+        session: &Session,
+        element: &IUIAutomationElement,
+        etype: crate::nav::NavElementType,
+    ) -> bool {
+        if etype.prefer_invoke() {
+            if let Ok(pattern) = (unsafe { element.GetCurrentPattern(UIA_InvokePatternId) }) {
+                let invoke: Result<IUIAutomationInvokePattern, _> = pattern.cast();
+                if let Ok(invoke) = invoke {
+                    if unsafe { invoke.Invoke() }.is_ok() {
+                        return true;
+                    }
+                }
+            }
+        }
+        let _ = unsafe { element.SetFocus() };
+        element_has_focus(session, element)
+    }
+
+    /// 当前前台进程的可交互元素快照（overlay 初次绘制 / 诊断）。
+    pub fn nav_scan(pid: u32) -> Result<Vec<crate::nav::NavElement>, FocusFailure> {
+        if !process_alive(pid) {
+            return Err(FocusFailure::TargetExited);
+        }
+        let Some((hwnd, _)) = target_window(pid) else {
+            return Err(FocusFailure::TargetExited);
+        };
+        let raw = hwnd.0 as isize;
+        submit(move |session| collect_nav_elements(session, hwnd_from_raw(raw)))
+            .unwrap_or(Err(FocusFailure::NotAccessible))
+    }
+
+    /// 读取当前前台进程 pid（供 nav 模式选目标）。
+    pub fn nav_foreground_pid() -> Option<u32> {
+        let pid = foreground_process_id()?;
+        (pid != current_process_id()).then_some(pid)
+    }
+
     /// 扫描目标进程当前窗口的可编辑候选（语义快照，不含输入内容）。
     pub fn scan_candidates(pid: u32) -> Result<Vec<FocusCandidate>, FocusFailure> {
         if !process_alive(pid) {
@@ -607,8 +835,9 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     capture_focused_target, capture_for_process, current_process_id, focus_best, focus_target,
-    foreground_process_id, foreground_title_len, process_alive, scan_candidates, window_of_process,
-    FocusAttempt, WindowsFocusBackend,
+    foreground_process_id, foreground_title_len, nav_foreground_pid, nav_move, nav_scan,
+    process_alive, scan_candidates, window_of_process, FocusAttempt, NavMoveResult,
+    WindowsFocusBackend,
 };
 
 /// 复用共享 UIA 工作线程（Per-Monitor V2、MTA）执行只读 UIA 任务的入口。
