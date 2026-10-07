@@ -202,8 +202,16 @@ impl KeyCode {
         }
     }
 
+    /// 返回该键在 PS/2 Set 1 中的（扫描码, 是否扩展位）。
+    ///
+    /// 只要 target 存在（除修饰键外均无扩展标记冲突），返回 `Some` 时注入走
+    /// `KEYEVENTF_SCANCODE` 路径（wVk=0, wScan=扫描码），目标应用才能从
+    /// `event.code` 识别按键（修复 #212：纯虚拟键注入 event.code 为空）。
+    /// 唯一返回 `None` 的是物理键盘上不存在的键（F13-F24，见 #215 手动录入），
+    /// 它们退回虚拟键路径注入。
     pub fn physical_scan_code(self) -> Option<(u16, bool)> {
         Some(match self {
+            // 修饰键：左键无扩展标记，右键走 E0 扩展。
             Self::Control | Self::LeftControl => (0x1D, false),
             Self::RightControl => (0x1D, true),
             Self::Shift | Self::LeftShift => (0x2A, false),
@@ -212,8 +220,83 @@ impl KeyCode {
             Self::RightAlt => (0x38, true),
             Self::LeftWindows => (0x5B, true),
             Self::RightWindows => (0x5C, true),
+            // 编辑/功能键：Oem3 就是 `~` 键。
+            Self::Backspace => (0x0E, false),
+            Self::Tab => (0x0F, false),
+            Self::Enter => (0x1C, false),
+            Self::Escape => (0x01, false),
+            Self::Space => (0x39, false),
             Self::Oem3 => (0x29, false),
-            _ => return None,
+            // 数字行：Digit1=0x02 ... Digit0=0x0B。
+            Self::Digit1 => (0x02, false),
+            Self::Digit2 => (0x03, false),
+            Self::Digit3 => (0x04, false),
+            Self::Digit4 => (0x05, false),
+            Self::Digit5 => (0x06, false),
+            Self::Digit6 => (0x07, false),
+            Self::Digit7 => (0x08, false),
+            Self::Digit8 => (0x09, false),
+            Self::Digit9 => (0x0A, false),
+            Self::Digit0 => (0x0B, false),
+            // 字母行。
+            Self::A => (0x1E, false),
+            Self::B => (0x30, false),
+            Self::C => (0x2E, false),
+            Self::D => (0x20, false),
+            Self::E => (0x12, false),
+            Self::F => (0x21, false),
+            Self::G => (0x22, false),
+            Self::H => (0x23, false),
+            Self::I => (0x17, false),
+            Self::J => (0x24, false),
+            Self::K => (0x25, false),
+            Self::L => (0x26, false),
+            Self::M => (0x32, false),
+            Self::N => (0x31, false),
+            Self::O => (0x18, false),
+            Self::P => (0x19, false),
+            Self::Q => (0x10, false),
+            Self::R => (0x13, false),
+            Self::S => (0x1F, false),
+            Self::T => (0x14, false),
+            Self::U => (0x16, false),
+            Self::V => (0x2F, false),
+            Self::W => (0x11, false),
+            Self::X => (0x2D, false),
+            Self::Y => (0x15, false),
+            Self::Z => (0x2C, false),
+            // F 行：F1-F10=0x3B-0x44，F11=0x57，F12=0x58。
+            Self::F1 => (0x3B, false),
+            Self::F2 => (0x3C, false),
+            Self::F3 => (0x3D, false),
+            Self::F4 => (0x3E, false),
+            Self::F5 => (0x3F, false),
+            Self::F6 => (0x40, false),
+            Self::F7 => (0x41, false),
+            Self::F8 => (0x42, false),
+            Self::F9 => (0x43, false),
+            Self::F10 => (0x44, false),
+            Self::F11 => (0x57, false),
+            Self::F12 => (0x58, false),
+            // 导航簇：全部走 E0 扩展。
+            Self::PageUp => (0x49, true),
+            Self::PageDown => (0x51, true),
+            Self::End => (0x4F, true),
+            Self::Home => (0x47, true),
+            Self::Left => (0x4B, true),
+            Self::Up => (0x48, true),
+            Self::Right => (0x4D, true),
+            Self::Down => (0x50, true),
+            Self::Insert => (0x52, true),
+            Self::Delete => (0x53, true),
+            Self::Apps => (0x5D, true),
+            // 媒体簇：音量/媒体键均为 E0 扩展扫描码。
+            Self::VolumeMute => (0x20, true),
+            Self::VolumeDown => (0x2E, true),
+            Self::VolumeUp => (0x30, true),
+            Self::MediaPrev => (0x10, true),
+            Self::MediaNext => (0x19, true),
+            Self::MediaPlayPause => (0x22, true),
         })
     }
 
@@ -1384,6 +1467,122 @@ mod tests {
             KeyCode::RightShift.physical_scan_code(),
             Some((0x36, false))
         );
+    }
+
+    #[test]
+    fn every_physically_present_key_carries_a_set1_scan_code() {
+        // #212：供《event.code 为空》修复使用。注入必须携带 PS/2 Set 1 扫描码，
+        // 目标应用（浏览器等）才能从 event.code 识别按键。除 F13-F24（物理键
+        // 不存在，见 #215 手动录入）与 Disabled 外，其余键都应返回 Some。
+        let alnum = [
+            (KeyCode::A, 0x1E, false),
+            (KeyCode::B, 0x30, false),
+            (KeyCode::C, 0x2E, false),
+            (KeyCode::D, 0x20, false),
+            (KeyCode::E, 0x12, false),
+            (KeyCode::F, 0x21, false),
+            (KeyCode::G, 0x22, false),
+            (KeyCode::H, 0x23, false),
+            (KeyCode::I, 0x17, false),
+            (KeyCode::J, 0x24, false),
+            (KeyCode::K, 0x25, false),
+            (KeyCode::L, 0x26, false),
+            (KeyCode::M, 0x32, false),
+            (KeyCode::N, 0x31, false),
+            (KeyCode::O, 0x18, false),
+            (KeyCode::P, 0x19, false),
+            (KeyCode::Q, 0x10, false),
+            (KeyCode::R, 0x13, false),
+            (KeyCode::S, 0x1F, false),
+            (KeyCode::T, 0x14, false),
+            (KeyCode::U, 0x16, false),
+            (KeyCode::V, 0x2F, false),
+            (KeyCode::W, 0x11, false),
+            (KeyCode::X, 0x2D, false),
+            (KeyCode::Y, 0x15, false),
+            (KeyCode::Z, 0x2C, false),
+            (KeyCode::Digit0, 0x0B, false),
+            (KeyCode::Digit1, 0x02, false),
+            (KeyCode::Digit2, 0x03, false),
+            (KeyCode::Digit3, 0x04, false),
+            (KeyCode::Digit4, 0x05, false),
+            (KeyCode::Digit5, 0x06, false),
+            (KeyCode::Digit6, 0x07, false),
+            (KeyCode::Digit7, 0x08, false),
+            (KeyCode::Digit8, 0x09, false),
+            (KeyCode::Digit9, 0x0A, false),
+        ];
+        for (key, scan, ext) in alnum {
+            assert_eq!(
+                key.physical_scan_code(),
+                Some((scan, ext)),
+                "alnum key {key:?}"
+            );
+        }
+
+        let fn_keys = [
+            (KeyCode::F1, 0x3B, false),
+            (KeyCode::F2, 0x3C, false),
+            (KeyCode::F3, 0x3D, false),
+            (KeyCode::F4, 0x3E, false),
+            (KeyCode::F5, 0x3F, false),
+            (KeyCode::F6, 0x40, false),
+            (KeyCode::F7, 0x41, false),
+            (KeyCode::F8, 0x42, false),
+            (KeyCode::F9, 0x43, false),
+            (KeyCode::F10, 0x44, false),
+            (KeyCode::F11, 0x57, false),
+            (KeyCode::F12, 0x58, false),
+        ];
+        for (key, scan, ext) in fn_keys {
+            assert_eq!(
+                key.physical_scan_code(),
+                Some((scan, ext)),
+                "fn key {key:?}"
+            );
+        }
+
+        let navigation = [
+            (KeyCode::Backspace, 0x0E, false),
+            (KeyCode::Tab, 0x0F, false),
+            (KeyCode::Enter, 0x1C, false),
+            (KeyCode::Escape, 0x01, false),
+            (KeyCode::Space, 0x39, false),
+            (KeyCode::PageUp, 0x49, true),
+            (KeyCode::PageDown, 0x51, true),
+            (KeyCode::End, 0x4F, true),
+            (KeyCode::Home, 0x47, true),
+            (KeyCode::Left, 0x4B, true),
+            (KeyCode::Up, 0x48, true),
+            (KeyCode::Right, 0x4D, true),
+            (KeyCode::Down, 0x50, true),
+            (KeyCode::Insert, 0x52, true),
+            (KeyCode::Delete, 0x53, true),
+            (KeyCode::Apps, 0x5D, true),
+        ];
+        for (key, scan, ext) in navigation {
+            assert_eq!(
+                key.physical_scan_code(),
+                Some((scan, ext)),
+                "nav key {key:?}"
+            );
+        }
+
+        let media = [
+            (KeyCode::VolumeMute, 0x20, true),
+            (KeyCode::VolumeDown, 0x2E, true),
+            (KeyCode::VolumeUp, 0x30, true),
+            (KeyCode::MediaPrev, 0x10, true),
+            (KeyCode::MediaNext, 0x19, true),
+            (KeyCode::MediaPlayPause, 0x22, true),
+        ];
+        for (key, scan, ext) in media {
+            assert_eq!(
+                key.physical_scan_code(),
+                Some((scan, ext)),
+                "media key {key:?}"
+            );
+        }
     }
 
     #[test]
