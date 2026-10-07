@@ -25,6 +25,7 @@
 //! 交付组合语义/连发）。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -58,6 +59,8 @@ pub enum EngineMessage {
     DeviceRemoved,
     /// 按键映射已更新：重建手势配置。
     MappingsChanged,
+    /// 前台窗口采样更新（#213）：按前台应用切换生效的快捷键 profile。
+    ForegroundChanged(crate::foreground::ForegroundInfo),
     Shutdown,
 }
 
@@ -229,6 +232,8 @@ impl MappingInjector for SendInputInjector {
 
 pub type ButtonEdgeCallback = Arc<dyn Fn(ButtonEdge) + Send + Sync>;
 pub type ButtonGestureCallback = Arc<dyn Fn(FiredGesture) + Send + Sync>;
+/// 前台 profile 变化回调（#213）：参数为生效的 profile 名（`None` = 回落基础映射）。
+pub type ButtonProfileCallback = Arc<dyn Fn(Option<String>) + Send + Sync>;
 
 /// 一次触发的手势（用于 UI 反馈与事件推送）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -250,6 +255,9 @@ pub struct ButtonMappingSnapshot {
     pub fired_gestures: u64,
     pub last_fired: Option<FiredGesture>,
     pub last_error: Option<String>,
+    /// 当前前台命中的 profile 名（`None` = 回落基础映射，或尚未采样到前台）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile: Option<String>,
     /// 最近一次「聚焦输入框」的结果（未使用过该功能时为 `None`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_focus: Option<crate::focus_service::FocusReport>,
@@ -275,15 +283,26 @@ pub(crate) fn persistent_suppress_mask(mapped_mask: u64) -> u64 {
 
 /// 按键映射引擎运行时。持有句柄即运行；线程在 `Shutdown` 或通道关闭时退出。
 pub struct ButtonMappingRuntime {
+    /// 引擎消费的**生效**映射：基础 `actions` 叠加当前命中 profile 的逐键
+    /// 覆盖（#213）。由 `set_mappings` 与前台变化时重解析。
     mappings: Arc<RwLock<ButtonMappings>>,
+    /// 完整映射（含全部 profile）的源真相：UI 读取与前台重解析的依据。
+    base_mappings: Arc<RwLock<ButtonMappings>>,
+    /// 最近一次前台窗口采样（运行时/前台观测/引擎共享）。
+    foreground: Arc<Mutex<Option<crate::foreground::ForegroundInfo>>>,
     sender: Sender<EngineMessage>,
     receiver: Mutex<Option<Receiver<EngineMessage>>>,
     state: Arc<Mutex<EngineState>>,
     edge_callbacks: Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    profile_callbacks: Arc<RwLock<Vec<ButtonProfileCallback>>>,
     /// 与引擎工作线程共享的注入器句柄（用于读取最近一次聚焦结果、触发测试聚焦）。
     injector: Arc<dyn MappingInjector>,
     worker: Option<JoinHandle<()>>,
+    /// 前台窗口观测线程（#213）：周期采样，变化时下发 [`EngineMessage::ForegroundChanged`]。
+    foreground_worker: Option<JoinHandle<()>>,
+    /// 停表标志：`Drop` 时置位，让观测线程在其下一个采样节拍退出。
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ButtonMappingRuntime {
@@ -301,29 +320,53 @@ impl ButtonMappingRuntime {
             }
         }));
         let mappings = Arc::new(RwLock::new(ButtonMappings::default()));
+        let base_mappings = Arc::new(RwLock::new(ButtonMappings::default()));
+        let foreground = Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(EngineState::default()));
         let edge_callbacks = Arc::new(RwLock::new(Vec::new()));
         let gesture_callbacks = Arc::new(RwLock::new(Vec::new()));
+        let profile_callbacks = Arc::new(RwLock::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let runtime = Self {
             mappings: Arc::clone(&mappings),
+            base_mappings: Arc::clone(&base_mappings),
+            foreground: Arc::clone(&foreground),
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Arc::clone(&state),
             edge_callbacks: Arc::clone(&edge_callbacks),
             gesture_callbacks: Arc::clone(&gesture_callbacks),
+            profile_callbacks: Arc::clone(&profile_callbacks),
             injector: Arc::clone(&injector),
             worker: None,
+            foreground_worker: None,
+            shutdown: Arc::clone(&shutdown),
         };
+
+        // 前台窗口观测线程：周期采样，发生变化时下发 ForegroundChanged。
+        let foreground_worker = std::thread::Builder::new()
+            .name("sayall-foreground-watch".to_owned())
+            .spawn({
+                let base_mappings = Arc::clone(&base_mappings);
+                let foreground = Arc::clone(&foreground);
+                let sender = runtime.sender.clone();
+                let shutdown = Arc::clone(&shutdown);
+                move || foreground_watch_loop(base_mappings, foreground, sender, shutdown)
+            })
+            .ok();
 
         let worker = std::thread::Builder::new()
             .name("sayall-button-mapping".to_owned())
             .spawn({
                 let mappings = Arc::clone(&mappings);
+                let base_mappings = Arc::clone(&base_mappings);
+                let foreground = Arc::clone(&foreground);
                 let state = Arc::clone(&state);
                 let snapshot = Arc::clone(&snapshot);
                 let edge_callbacks = Arc::clone(&edge_callbacks);
                 let gesture_callbacks = Arc::clone(&gesture_callbacks);
+                let profile_callbacks = Arc::clone(&profile_callbacks);
                 let receiver = runtime
                     .receiver
                     .lock()
@@ -334,10 +377,13 @@ impl ButtonMappingRuntime {
                     engine_worker(
                         receiver,
                         mappings,
+                        base_mappings,
+                        foreground,
                         state,
                         snapshot,
                         edge_callbacks,
                         gesture_callbacks,
+                        profile_callbacks,
                         injector,
                         usage,
                     )
@@ -346,6 +392,7 @@ impl ButtonMappingRuntime {
             .ok();
         let mut runtime = runtime;
         runtime.worker = worker;
+        runtime.foreground_worker = foreground_worker;
         runtime
     }
 
@@ -355,25 +402,53 @@ impl ButtonMappingRuntime {
     }
 
     /// 更新按键映射：热加载到引擎 + 同步门控吞键配置。
+    ///
+    /// 存两份：`base_mappings`（完整源真相）与 `mappings`（叠加当前前台命中
+    /// profile 的生效值）。吞键掩码取基础 + 全部 profile 的并集，确保任何
+    /// profile 映射过的键都在前台切换前先被拦截。
     pub fn set_mappings(&self, mappings: ButtonMappings) {
+        *self
+            .base_mappings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mappings.clone();
+        let foreground = lock_foreground(&self.foreground);
         *self
             .mappings
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mappings.clone();
-        let mapped_mask = mappings.mapped_mask();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            mappings.resolved_for_foreground(&foreground);
+        let mapped_mask = mappings.mapped_mask_union();
         key_gate::configure(mappings.enabled, mapped_mask);
         key_gate::set_persistent_mask(persistent_suppress_mask(mapped_mask));
         let _ = self.sender.send(EngineMessage::MappingsChanged);
     }
 
+    /// 完整按键映射（含全部 profile，源真相；供 UI 读取）。
     pub fn mappings(&self) -> ButtonMappings {
-        read_lock(&self.mappings).clone()
+        read_lock(&self.base_mappings).clone()
+    }
+
+    /// 当前前台命中的 profile 名（`None` = 回落基础映射）。
+    pub fn active_profile(&self) -> Option<String> {
+        let foreground = lock_foreground(&self.foreground);
+        let base = read_lock(&self.base_mappings);
+        base.active_mapping_profile(&foreground)
+            .map(|p| p.name.clone())
+    }
+
+    /// 注册前台 profile 变化回调（UI 事件推送）。
+    pub fn on_profile_changed(&self, callback: ButtonProfileCallback) {
+        self.profile_callbacks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(callback);
     }
 
     pub fn snapshot(&self) -> ButtonMappingSnapshot {
         let state = lock_state(&self.state);
         ButtonMappingSnapshot {
             enabled: read_lock(&self.mappings).enabled,
+            active_profile: self.active_profile(),
             gate_active: key_gate::is_gate_thread_alive(),
             listener_active: key_gate::listener_active(),
             swallowed_edges: key_gate::swallowed_edge_count(),
@@ -420,9 +495,13 @@ impl ButtonMappingRuntime {
 
 impl Drop for ButtonMappingRuntime {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.sender.send(EngineMessage::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(foreground_worker) = self.foreground_worker.take() {
+            let _ = foreground_worker.join();
         }
     }
 }
@@ -546,10 +625,13 @@ fn note_advance_ticks(repeat_runs: &mut RepeatRuns, ticks: Vec<(RemoteButton, Bu
 fn engine_worker(
     receiver: Receiver<EngineMessage>,
     mappings: Arc<RwLock<ButtonMappings>>,
+    base_mappings: Arc<RwLock<ButtonMappings>>,
+    foreground: Arc<Mutex<Option<crate::foreground::ForegroundInfo>>>,
     state: Arc<Mutex<EngineState>>,
     snapshot: Arc<Mutex<RawInputSnapshot>>,
     edge_callbacks: Arc<RwLock<Vec<ButtonEdgeCallback>>>,
     gesture_callbacks: Arc<RwLock<Vec<ButtonGestureCallback>>>,
+    profile_callbacks: Arc<RwLock<Vec<ButtonProfileCallback>>>,
     injector: Arc<dyn MappingInjector>,
     usage: Arc<UsageCounters>,
 ) {
@@ -739,6 +821,50 @@ fn engine_worker(
                     "map_reconfig enabled={} buttons_configured={}",
                     mappings.enabled, configured
                 ));
+            }
+            EngineMessage::ForegroundChanged(fg) => {
+                let previous_active = {
+                    let base = read_lock(&base_mappings);
+                    let previous = lock_foreground(&foreground);
+                    base.active_mapping_profile(&previous)
+                        .map(|profile| profile.name.clone())
+                };
+                *foreground
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fg.clone());
+                // 按新前台重解析生效映射并写入生效存储（供 active_profile()/action_for 读取）。
+                let resolved = read_lock(&base_mappings).resolved_for_foreground(&fg);
+                let effective_changed = {
+                    let mut current = mappings
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let changed = *current != resolved;
+                    *current = resolved.clone();
+                    changed
+                };
+                // 仅当生效映射真的变了才重建手势配置并重置状态：前台来回切换但
+                // profile 不命中（回落基础）时，进行中的长按/连发不应被打断。
+                if effective_changed {
+                    recognizer.configure(&resolved);
+                    // 配置变化重置全部手势状态：挂起泄漏对冲标记一并失效。
+                    native_pending.clear();
+                    finish_all_repeat_runs(&mut repeat_runs, "foreground");
+                }
+                let active = {
+                    let base = read_lock(&base_mappings);
+                    base.active_mapping_profile(&fg)
+                        .map(|profile| profile.name.clone())
+                };
+                if active != previous_active {
+                    for callback in read_callbacks(&profile_callbacks).iter() {
+                        callback(active.clone());
+                    }
+                    crate::ble::gatt_note(format!(
+                        "map_profile fg={:?} active={}",
+                        fg,
+                        active.as_deref().unwrap_or("<base>")
+                    ));
+                }
             }
             EngineMessage::Shutdown => {
                 // 显式关闭同样要补齐进行中的连续触发聚合日志（评审发现 2）。
@@ -1120,6 +1246,60 @@ fn lock_snapshot(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+/// 读取最近一次前台采样；尚未采样时为空的 [`ForegroundInfo`]（无命中判据）。
+fn lock_foreground(
+    foreground: &Mutex<Option<crate::foreground::ForegroundInfo>>,
+) -> crate::foreground::ForegroundInfo {
+    foreground
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or(crate::foreground::ForegroundInfo {
+            process_name: None,
+            title: None,
+        })
+}
+
+/// 前台窗口观测线程主循环（#213）：周期采样，采样结果与上次不同时更新共享
+/// 前台并下发 [`EngineMessage::ForegroundChanged`]。通道断开即退出。
+fn foreground_watch_loop(
+    _base_mappings: Arc<RwLock<ButtonMappings>>,
+    foreground: Arc<Mutex<Option<crate::foreground::ForegroundInfo>>>,
+    sender: Sender<EngineMessage>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut last: Option<crate::foreground::ForegroundInfo> = None;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        // 映射尚未加载（base 空）时继续采样、等前台变化落地后由
+        // `set_mappings` 自行用当前前台重解析——这里仅做采样与通知。
+        let current = crate::foreground::current_foreground();
+        let changed = current != last;
+        if changed {
+            *foreground
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = current.clone();
+            last = current.clone();
+            if let Some(fg) = &current {
+                if sender
+                    .send(EngineMessage::ForegroundChanged(fg.clone()))
+                    .is_err()
+                {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        std::thread::sleep(FOREGROUND_POLL_INTERVAL);
+    }
+}
+
+/// 前台采样周期（毫秒级节拍；前台切换为 OS 级低频事件，无需高频轮询）。
+const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(800);
 
 #[cfg(test)]
 mod tests {

@@ -655,6 +655,120 @@ impl From<ButtonActionsWire> for ButtonActions {
     }
 }
 
+/// 前台窗口匹配规则（#213 快捷键 profile 的命中判据）。
+///
+/// 两个判据都可选：至少提供一个才算有约束；都提供时须**全部命中**。
+/// `process_name` 按不区分大小写的完整文件名匹配（`chrome.exe`）；
+/// `title_contains` 按不区分大小写的子串包含匹配窗口标题。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowMatcher {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_contains: Option<String>,
+}
+
+impl WindowMatcher {
+    /// 是否已有任何约束（无约束的 profile 会宽配所有前台，`normalized` 丢弃）。
+    pub fn has_constraint(&self) -> bool {
+        self.process_name.is_some() || self.title_contains.is_some()
+    }
+
+    /// 该规则是否命中一次前台采样。`fg` 为空（无前台/采样失败）时不命中。
+    pub fn matches(&self, fg: &crate::foreground::ForegroundInfo) -> bool {
+        if fg.is_empty() || !self.has_constraint() {
+            return false;
+        }
+        if let Some(needle) = &self.process_name {
+            let hit = fg
+                .process_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(needle));
+            if !hit {
+                return false;
+            }
+        }
+        if let Some(needle) = &self.title_contains {
+            let needle = needle.to_lowercase();
+            let hit = fg
+                .title
+                .as_deref()
+                .is_some_and(|title| title.to_lowercase().contains(&needle));
+            if !hit {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// 单条快捷键映射方案（profile）：命中前台窗口后，用它**逐键覆盖**基础
+/// `ButtonMappings.actions`（未覆盖的键回落基础映射）。同一键的整套
+/// `ButtonActions` 整体替换。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingProfile {
+    pub name: String,
+    #[serde(default)]
+    pub matcher: WindowMatcher,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<RemoteButton, ButtonActions>,
+}
+
+impl MappingProfile {
+    /// 校验并规整为可保存形态；返回 `Ok` 才可落盘。
+    fn normalized(&mut self) -> Result<(), SendInputError> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(SendInputError::Backend("profile 名称不能为空".to_owned()));
+        }
+        if name.chars().count() > MAX_PROFILE_NAME_LEN {
+            return Err(SendInputError::Backend(format!(
+                "profile 名称超过 {MAX_PROFILE_NAME_LEN} 字符"
+            )));
+        }
+        self.name = name.to_owned();
+        if !self.matcher.has_constraint() {
+            return Err(SendInputError::Backend(
+                "profile 至少要指定进程名或窗口标题规则".to_owned(),
+            ));
+        }
+        if let Some(value) = &mut self.matcher.process_name {
+            if value.trim().is_empty() {
+                return Err(SendInputError::Backend("profile 进程名不能为空".to_owned()));
+            }
+            *value = value.trim().to_owned();
+        }
+        if let Some(value) = &mut self.matcher.title_contains {
+            if value.trim().is_empty() {
+                return Err(SendInputError::Backend(
+                    "profile 窗口标题关键字不能为空".to_owned(),
+                ));
+            }
+            *value = value.trim().to_owned();
+        }
+        for actions in self.actions.values_mut() {
+            for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
+                if let ButtonAction::Shortcut { chord } = action {
+                    *chord = chord.clone().validated()?;
+                }
+                match action {
+                    ButtonAction::Scroll { steps, .. } => validate_mouse_amount(*steps, 100)?,
+                    ButtonAction::MouseMove { distance, .. } => {
+                        validate_mouse_amount(*distance, 2000)?
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+const MAX_PROFILE_NAME_LEN: usize = 32;
+const MAX_MAPPING_PROFILES: usize = 20;
+
 /// 按键映射配置结构版本：0 = 本功能之前的旧文件（加载时按旧行为迁移），
 /// 1 = 含显式「按住连续触发」（`holdRepeat`）。保存/导出统一写当前版本。
 pub const BUTTON_MAPPINGS_SCHEMA_VERSION: u32 = 1;
@@ -676,6 +790,10 @@ pub struct ButtonMappings {
     /// 去重/删库都不应该影响已记录的档案。
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub focus_profiles: BTreeMap<String, crate::focus::AppFocusProfile>,
+    /// 按前台应用切换的快捷键映射方案（#213）。匹配首个命中的 profile
+    /// 生效（顺序优先）；未命中任何 profile 时使用基础 `actions`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_profiles: Vec<MappingProfile>,
 }
 
 fn default_enabled() -> bool {
@@ -690,6 +808,7 @@ impl Default for ButtonMappings {
             actions: BTreeMap::new(),
             applications: Vec::new(),
             focus_profiles: BTreeMap::new(),
+            mapping_profiles: Vec::new(),
         }
     }
 }
@@ -711,6 +830,8 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
             applications: Vec<crate::app_launcher::CustomAppPick>,
             #[serde(default)]
             focus_profiles: BTreeMap<String, crate::focus::AppFocusProfile>,
+            #[serde(default)]
+            mapping_profiles: Vec<MappingProfile>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let actions = wire
@@ -725,6 +846,7 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
             actions,
             applications: wire.applications,
             focus_profiles: wire.focus_profiles,
+            mapping_profiles: wire.mapping_profiles,
         })
     }
 }
@@ -778,6 +900,26 @@ impl ButtonMappings {
         }
         #[cfg(not(windows))]
         let _ = dropped;
+        // 快捷键映射方案（#213）：先逐条校验，非法整条丢弃（错误指给整单
+        // 会连累其余 profile 与基础映射）；单条校验失败直接报错便于 UI 定位。
+        if this.mapping_profiles.len() > MAX_MAPPING_PROFILES {
+            return Err(SendInputError::Backend(format!(
+                "快捷键映射方案数量超过上限（{MAX_MAPPING_PROFILES}）"
+            )));
+        }
+        let mut kept = Vec::with_capacity(this.mapping_profiles.len());
+        for (index, profile) in this.mapping_profiles.iter_mut().enumerate() {
+            match profile.normalized() {
+                Ok(()) => kept.push(profile.clone()),
+                Err(error) => {
+                    return Err(SendInputError::Backend(format!(
+                        "快捷键映射方案 #{index}（{}）无效：{error}",
+                        profile.name
+                    )));
+                }
+            }
+        }
+        this.mapping_profiles = kept;
         for actions in this.actions.values_mut() {
             for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
                 if let ButtonAction::Shortcut { chord } = action {
@@ -851,6 +993,52 @@ impl ButtonMappings {
             }
         }
         mask
+    }
+
+    /// 基础 `actions` 与全部 profile 动作的按键位并集：门控的吞键掩码。
+    ///
+    /// 前台 profile 切换只改手势配置、不改吞键集合——所有可能映射过的键都要
+    /// 常驻被吞，避免切到某 profile 时新增键位不被拦截造成双输入。
+    pub fn mapped_mask_union(&self) -> u64 {
+        let mut mask = self.mapped_mask();
+        if !self.enabled {
+            return mask;
+        }
+        for profile in &self.mapping_profiles {
+            for (button, actions) in &profile.actions {
+                if actions.any_configured() {
+                    mask |= 1u64 << button.ordinal();
+                }
+            }
+        }
+        mask
+    }
+
+    /// 按前台采样选择生效的 profile：顺序优先，返回**首个**命中的方案。
+    pub fn active_mapping_profile<'a>(
+        &'a self,
+        fg: &crate::foreground::ForegroundInfo,
+    ) -> Option<&'a MappingProfile> {
+        if fg.is_empty() {
+            return None;
+        }
+        self.mapping_profiles
+            .iter()
+            .find(|profile| profile.matcher.matches(fg))
+    }
+
+    /// 针对前台采样解析出**生效的完整映射**：基础 `actions` 之上叠加命中
+    /// profile 的逐键覆盖，未命中（或未启用）时即基础本身。
+    ///
+    /// 引擎持这份「生效值」，供手势识别与注入读取；`mapping_profiles` 原样
+    /// 保留在返回体里，方便回读与统一门控掩码。
+    pub fn resolved_for_foreground(&self, fg: &crate::foreground::ForegroundInfo) -> Self {
+        let mut resolved = self.clone();
+        let Some(profile) = self.active_mapping_profile(fg).cloned() else {
+            return resolved;
+        };
+        resolved.actions.extend(profile.actions);
+        resolved
     }
 }
 
@@ -1510,6 +1698,7 @@ mod tests {
             actions: mappings.actions.clone(),
             applications: Vec::new(),
             focus_profiles: BTreeMap::new(),
+            mapping_profiles: Vec::new(),
         };
         assert_eq!(disabled.mapped_mask(), 0, "总开关关闭时不吞任何键");
     }
@@ -1971,5 +2160,214 @@ mod tests {
         });
         let mappings = serde_json::from_value::<ButtonMappings>(json).unwrap();
         assert!(mappings.normalized().is_err(), "未来版本必须拒绝");
+    }
+
+    // ---- #213 快捷键 profile：匹配 / 兜底 / 合并 / 校验 / 序列化 ----
+
+    fn fg(process_name: &str, title: &str) -> crate::foreground::ForegroundInfo {
+        crate::foreground::ForegroundInfo {
+            process_name: Some(process_name.to_owned()),
+            title: Some(title.to_owned()),
+        }
+    }
+
+    fn matcher(process_name: Option<&str>, title: Option<&str>) -> WindowMatcher {
+        WindowMatcher {
+            process_name: process_name.map(|s| s.to_owned()),
+            title_contains: title.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn window_matcher_process_name_matches_case_insensitively() {
+        let rule = matcher(Some("Chrome.exe"), None);
+        assert!(rule.has_constraint());
+        assert!(rule.matches(&fg("chrome.EXE", "Google Chrome")));
+        assert!(!rule.matches(&fg("firefox.exe", "Chrome")));
+    }
+
+    #[test]
+    fn window_matcher_title_matches_as_case_insensitive_substring() {
+        let rule = matcher(None, Some("百度"));
+        assert!(rule.matches(&fg("chrome.exe", "百度 首页")));
+        assert!(!rule.matches(&fg("firefox.exe", "必应")));
+    }
+
+    #[test]
+    fn window_matcher_requires_all_constraints_and_rejects_empty_foreground() {
+        let all = matcher(Some("chrome.exe"), Some("搜索结果"));
+        assert!(all.matches(&fg("chrome.exe", "百度 搜索结果")));
+        assert!(!all.matches(&fg("chrome.exe", "无关")));
+        // 空前台（采样失败 / 无前台）绝不命中。
+        let empty = crate::foreground::ForegroundInfo {
+            process_name: None,
+            title: None,
+        };
+        assert!(!all.matches(&empty));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn profile_normalization_trims_name_and_rejects_empty_or_constraintless() {
+        let mut good = MappingProfile {
+            name: "  办公  ".to_owned(),
+            matcher: matcher(Some("wechat.exe"), None),
+            actions: BTreeMap::new(),
+        };
+        good.normalized().unwrap();
+        assert_eq!(good.name, "办公");
+
+        // 无约束的 profile 丢弃。
+        let mut no_constraint = MappingProfile {
+            name: "空规则".to_owned(),
+            matcher: matcher(None, None),
+            actions: BTreeMap::new(),
+        };
+        assert!(no_constraint.normalized().is_err());
+
+        // 空名称丢弃。
+        let mut no_name = MappingProfile {
+            name: "  ".to_owned(),
+            matcher: matcher(Some("chrome.exe"), None),
+            actions: BTreeMap::new(),
+        };
+        assert!(no_name.normalized().is_err());
+    }
+
+    #[test]
+    fn mapping_profiles_serialize_round_trip_with_defaults() {
+        let mut mappings = ButtonMappings::default();
+        mappings.enabled = true;
+        mappings
+            .actions
+            .insert(RemoteButton::Back, ButtonActions::default());
+        mappings.mapping_profiles.push(MappingProfile {
+            name: "影音".to_owned(),
+            matcher: matcher(Some("mpv.exe"), None),
+            actions: BTreeMap::from([(
+                RemoteButton::Left,
+                ButtonActions {
+                    single: shortcut(&[KeyCode::Space]),
+                    ..ButtonActions::default()
+                },
+            )]),
+        });
+        let json = serde_json::to_string(&mappings).unwrap();
+        let back: ButtonMappings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mapping_profiles.len(), 1);
+        assert_eq!(back.mapping_profiles[0].name, "影音");
+        assert_eq!(
+            back.actions
+                .get(&RemoteButton::Back)
+                .cloned()
+                .unwrap_or_default(),
+            ButtonActions::default()
+        );
+    }
+
+    #[test]
+    fn active_mapping_profile_picks_first_match_and_skips_others() {
+        let mut mappings = ButtonMappings::default();
+        mappings.mapping_profiles.push(MappingProfile {
+            name: "A".to_owned(),
+            matcher: matcher(Some("a.exe"), None),
+            actions: BTreeMap::new(),
+        });
+        mappings.mapping_profiles.push(MappingProfile {
+            name: "B".to_owned(),
+            matcher: matcher(Some("b.exe"), None),
+            actions: BTreeMap::new(),
+        });
+        assert_eq!(
+            mappings
+                .active_mapping_profile(&fg("A.EXE", "x"))
+                .map(|p| p.name.as_str()),
+            Some("A")
+        );
+        assert_eq!(
+            mappings
+                .active_mapping_profile(&fg("b.exe", "x"))
+                .map(|p| p.name.as_str()),
+            Some("B")
+        );
+        // 无前台 / 不命中任一 → None。
+        assert_eq!(mappings.active_mapping_profile(&fg("c.exe", "x")), None);
+    }
+
+    #[test]
+    fn resolved_for_foreground_overlays_profile_actions_onto_base() {
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Left,
+            ButtonActions {
+                single: shortcut(&[KeyCode::Left]),
+                ..ButtonActions::default()
+            },
+        );
+        mappings.mapping_profiles.push(MappingProfile {
+            name: "视频".to_owned(),
+            matcher: matcher(Some("mpv.exe"), None),
+            actions: BTreeMap::from([(
+                RemoteButton::Left,
+                ButtonActions {
+                    single: shortcut(&[KeyCode::MediaNext]), // 快退
+                    double: shortcut(&[KeyCode::Left]),
+                    ..ButtonActions::default()
+                },
+            )]),
+        });
+
+        // 未命中：生效值 == 基础（未覆盖的键回落基础）。
+        let other_fg = fg("chrome.exe", "x");
+        let resolved_other = mappings.resolved_for_foreground(&other_fg);
+        assert_eq!(resolved_other.mapping_profiles.len(), 1);
+        assert_eq!(
+            resolved_other.action_for(RemoteButton::Left, ButtonTrigger::Single),
+            shortcut(&[KeyCode::Left])
+        );
+
+        // 命中：profile 的整套 ButtonActions 覆盖该键。
+        let mpv_fg = fg("mpv.exe", "视频");
+        let resolved = mappings.resolved_for_foreground(&mpv_fg);
+        assert_eq!(
+            resolved.action_for(RemoteButton::Left, ButtonTrigger::Single),
+            shortcut(&[KeyCode::MediaNext])
+        );
+        assert_eq!(
+            resolved.action_for(RemoteButton::Left, ButtonTrigger::Double),
+            shortcut(&[KeyCode::Left])
+        );
+    }
+
+    #[test]
+    fn mapped_mask_union_covers_base_and_all_profiles() {
+        let mut mappings = ButtonMappings::default();
+        mappings.enabled = true;
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                single: shortcut(&[KeyCode::Escape]),
+                ..ButtonActions::default()
+            },
+        );
+        mappings.mapping_profiles.push(MappingProfile {
+            name: "p".to_owned(),
+            matcher: matcher(Some("x.exe"), None),
+            actions: BTreeMap::from([(
+                RemoteButton::Power,
+                ButtonActions {
+                    single: shortcut(&[KeyCode::F1]),
+                    ..ButtonActions::default()
+                },
+            )]),
+        });
+        let mask = mappings.mapped_mask_union();
+        assert_ne!(mask & (1u64 << RemoteButton::Back.ordinal()), 0);
+        assert_ne!(mask & (1u64 << RemoteButton::Power.ordinal()), 0);
+
+        // 关闭时仅基础掩码（不含 profile 额外键）。
+        mappings.enabled = false;
+        let mask_off = mappings.mapped_mask_union();
+        assert_eq!(mask_off & (1u64 << RemoteButton::Power.ordinal()), 0);
     }
 }
