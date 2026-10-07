@@ -1078,7 +1078,11 @@ mod tests {
             (0x86, KeyCode::F23),
             (0x87, KeyCode::F24),
         ] {
-            assert_eq!(capture_key_code(vk, 0, false), Some(expected), "VK 0x{vk:X}");
+            assert_eq!(
+                capture_key_code(vk, 0, false),
+                Some(expected),
+                "VK 0x{vk:X}"
+            );
         }
     }
 
