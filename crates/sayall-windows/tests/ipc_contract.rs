@@ -73,6 +73,7 @@ fn rust_serialization_matches_the_shared_windows_runtime_contract() {
                 }),
                 last_error: None,
                 last_focus: None,
+                active_profile: None,
             },
         },
         "pairedRemotes": [
