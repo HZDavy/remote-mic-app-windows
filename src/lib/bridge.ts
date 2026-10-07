@@ -1367,6 +1367,20 @@ const keyLabels: Record<string, string> = {
   f10: "F10",
   f11: "F11",
   f12: "F12",
+  // #215：F13-F24 多数键盘无实体、无法录制，仅由手动录入文本触发。
+  f13: "F13",
+  f14: "F14",
+  f15: "F15",
+  f16: "F16",
+  f17: "F17",
+  f18: "F18",
+  f19: "F19",
+  f20: "F20",
+  f21: "F21",
+  f22: "F22",
+  f23: "F23",
+  f24: "F24",
+  oem3: "`",
 };
 
 export function keyLabel(code: KeyCode): string {

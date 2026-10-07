@@ -1085,9 +1085,11 @@ describe("buttons mapping page", () => {
       .find((card) => card.text().includes("电源"))!;
     await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
     const safeToggle = wrapper.find(".safe-capture-toggle input");
-    const shortcutRow = wrapper.find(".custom-shortcut-row");
     const toggleRow = wrapper.find(".safe-capture-toggle");
-    expect(shortcutRow.element.nextElementSibling).toBe(toggleRow.element);
+    // #215 手动录入行紧邻「安全录入模式」开关之前。
+    const manualEntry = wrapper.find(".manual-entry-row");
+    expect(manualEntry.exists()).toBe(true);
+    expect(manualEntry.element.nextElementSibling).toBe(toggleRow.element);
     expect(safeToggle.classes()).toContain("toggle-input");
     expect(safeToggle.element.nextElementSibling?.textContent).toContain(
       "直接录入无法完成或会触发系统动作时再开启",

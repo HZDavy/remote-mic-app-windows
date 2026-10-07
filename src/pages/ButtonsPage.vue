@@ -4,6 +4,7 @@ import RegisteredAppsDialog from "../components/RegisteredAppsDialog.vue";
 import EnhancedCaptureConfirmDialog from "../components/EnhancedCaptureConfirmDialog.vue";
 import BatteryIndicator from "../components/BatteryIndicator.vue";
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
+import { parseManualChord, ManualKeyError } from "../lib/manual-keys";
 import { DEVICE_ACTION_SECTION_ENABLED } from "../lib/feature-flags";
 import {
   actionSummary,
@@ -516,6 +517,31 @@ function applyAction(action: ButtonAction): void {
   // 对齐 Mac：点击动作即自动保存生效（静默；失败时显示错误信息）。互斥收口
   // 产生的说明随保存一起展示（否则会被 persist 的清理覆盖）。
   void persist(reconciled.notice ?? undefined);
+}
+
+/**
+ * #215 手动录入：输入键盘上没有的键（F13-F24）或通用修饰键（ctrl/win 等），
+ * 解析为 snake_case chord 后作为快捷键动作落到当前编辑格。
+ */
+const manualEntryText = ref("");
+const manualEntryError = ref<string | null>(null);
+
+function applyManualChord(): void {
+  if (!editingTarget.value) return;
+  manualEntryError.value = null;
+  try {
+    const keys = parseManualChord(manualEntryText.value);
+    applyAction({ type: "shortcut", chord: { keys } });
+    manualEntryText.value = "";
+    statusMessage.value = "快捷键已按手动录入生效";
+  } catch (error) {
+    manualEntryError.value =
+      error instanceof ManualKeyError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : String(error);
+  }
 }
 
 /**
@@ -2093,6 +2119,36 @@ onUnmounted(() => {
               {{ captureDisplay.length ? chordLabel({ keys: captureDisplay }) : (safeCaptureMode ? "先选择修饰键" : "请按下快捷键组合") }}
             </span>
           </div>
+          <div class="manual-entry-row">
+            <label class="manual-entry-label" for="manual-key-input">
+              手动录入
+              <small class="muted" title="用于键盘上没有的键（如 f13-f24）或通用修饰键名称">
+                没有的键也能录（如 f13、ctrl、win）
+              </small>
+            </label>
+            <div class="manual-entry-inputs">
+              <input
+                id="manual-key-input"
+                v-model="manualEntryText"
+                type="text"
+                placeholder="如 f13、ctrl + f15、win+d"
+                spellcheck="false"
+                :disabled="busy || capturingShortcut || captureStarting"
+                @keydown.enter.prevent="applyManualChord"
+              />
+              <button
+                class="chip"
+                type="button"
+                :disabled="busy || capturingShortcut || captureStarting || !editingTarget || !manualEntryText.trim()"
+                @click="applyManualChord"
+              >
+                应用
+              </button>
+            </div>
+            <p v-if="manualEntryError" class="muted editor-note manual-entry-error">
+              {{ manualEntryError }}
+            </p>
+          </div>
           <label
             class="toggle-row safe-capture-toggle"
             title="开启后，通过界面选择修饰键，键盘只需按主键。"
@@ -2255,4 +2311,12 @@ onUnmounted(() => {
    `.action-section .preset-grid` 的 6px。 */
 .action-section .preset-grid.app-library-actions { margin-top: 9px; }
 .app-library-search { display: block; width: min(300px, 100%); box-sizing: border-box; margin-top: 10px; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid #888; border-radius: 4px; }
+/* #215 手动录入：供没有实体的键（F13-F24）与通用修饰键名使用。 */
+.manual-entry-row { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.manual-entry-label { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.manual-entry-label small { font-size: 12px; }
+.manual-entry-inputs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.manual-entry-inputs input { width: min(280px, 100%); box-sizing: border-box; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid #888; border-radius: 4px; }
+.manual-entry-inputs input:focus { outline: none; border-color: var(--brand, currentColor); }
+.manual-entry-error { margin: 0; font-size: 12px; }
 </style>
