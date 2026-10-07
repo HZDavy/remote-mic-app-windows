@@ -40,12 +40,14 @@ import {
   stopShortcutCapture,
   subscribeButtonEdges,
   subscribeButtonGestures,
+  subscribeProfileChanged,
   subscribeShortcutCaptureEdges,
   type ButtonAction,
   type ButtonActions,
   type ButtonEdge,
   type ButtonMappingSnapshot,
   type ButtonMappings,
+  type MappingProfile,
   type ButtonTrigger,
   type CustomAppPick,
   type AppFocusProfile,
@@ -239,6 +241,7 @@ let capturedChord: KeyCode[] | null = null;
 let unlistenEdges: (() => void) | null = null;
 let unlistenGestures: (() => void) | null = null;
 let unlistenShortcutCapture: (() => void) | null = null;
+let unlistenProfile: (() => void) | null = null;
 let captureTimeout: number | null = null;
 let captureRequestId = 0;
 let snapshotTimer: number | null = null;
@@ -257,6 +260,8 @@ function releasePageResources(): void {
   unlistenGestures = null;
   unlistenShortcutCapture?.();
   unlistenShortcutCapture = null;
+  unlistenProfile?.();
+  unlistenProfile = null;
   if (captureTimeout !== null) window.clearTimeout(captureTimeout);
   captureTimeout = null;
   void stopShortcutCapture();
@@ -264,6 +269,8 @@ function releasePageResources(): void {
   snapshotTimer = null;
   if (flashTimer !== null) window.clearTimeout(flashTimer);
   flashTimer = null;
+  if (profileNoticeTimer !== null) window.clearTimeout(profileNoticeTimer);
+  profileNoticeTimer = null;
   resizeObserver?.disconnect();
   resizeObserver = null;
 }
@@ -913,6 +920,196 @@ const captureSwitchTitle = computed(() =>
 
 let saveQueue: Promise<void> = Promise.resolve();
 let saveRequest = 0;
+
+/* ------------------------------------------------------------------ *
+ * #213 按前台应用切换方案（profile）编辑
+ * ------------------------------------------------------------------ */
+/** 当前前台命中的 profile 名；由 bridge 事件 `mapping-profile-changed` 推送。 */
+const activeProfile = ref<string | null>(null);
+/** 面板是否展开（默认收起，降低首屏视觉负担）。 */
+const profilePanelOpen = ref(false);
+/** 新增方案表单。 */
+const newProfileForm = ref<{ name: string; processName: string; titleContains: string }>({
+  name: "",
+  processName: "",
+  titleContains: "",
+});
+const profileFormError = ref<string | null>(null);
+/** 当前正在编辑 matcher 的下标；null = 无。 */
+const editingProfileIndex = ref<number | null>(null);
+const editedMatcher = ref<{ processName: string; titleContains: string }>({
+  processName: "",
+  titleContains: "",
+});
+
+/** 当前方案的派生视图（顺序优先，首个命中生效）。 */
+const profiles = computed<MappingProfile[]>(() => mappings.value.mappingProfiles ?? []);
+
+/** 方案按键覆盖编辑器里展示的按键顺序（与 `PLACEMENTS` 一致的语义次序）。 */
+const PROFILE_BUTTONS: RemoteButton[] = [
+  "back",
+  "ok",
+  "tv",
+  "home",
+  "right",
+  "left",
+  "down",
+  "up",
+  "menu",
+  "power",
+  "volume_mute",
+  "volume_up",
+  "volume_down",
+];
+
+/** profile 动作覆盖编辑：选中方案 + 按键 + 手动录入 chord。 */
+const profileKeyTarget = ref<{ index: number; button: RemoteButton } | null>(null);
+const profileChordText = ref("");
+const profileChordError = ref<string | null>(null);
+
+/** 交互提示条（与 statusMessage 同位置，避免覆盖保存状态文案）。 */
+const profileNotice = ref<string | null>(null);
+let profileNoticeTimer: number | null = null;
+
+function showProfileNotice(message: string): void {
+  profileNotice.value = message;
+  if (profileNoticeTimer !== null) window.clearTimeout(profileNoticeTimer);
+  profileNoticeTimer = window.setTimeout(() => {
+    profileNotice.value = null;
+  }, 3_000);
+}
+
+/** 新增方案（名称非空；进程名与标题关键字至少其一，否则无法投递匹配）。 */
+async function addProfile(): Promise<void> {
+  profileFormError.value = null;
+  const name = newProfileForm.value.name.trim();
+  const processName = newProfileForm.value.processName.trim();
+  const titleContains = newProfileForm.value.titleContains.trim();
+  if (!name) {
+    profileFormError.value = "请填写方案名称。";
+    return;
+  }
+  if (!processName && !titleContains) {
+    profileFormError.value = "请至少填写「进程名」或「窗口标题关键字」其一，否则方案永远匹配不上。";
+    return;
+  }
+  const next: ButtonMappings = {
+    ...mappings.value,
+    mappingProfiles: [
+      ...profiles.value,
+      {
+        name,
+        matcher: {
+          processName: processName || null,
+          titleContains: titleContains || null,
+        },
+        actions: {},
+      },
+    ],
+  };
+  mappings.value = next;
+  newProfileForm.value = { name: "", processName: "", titleContains: "" };
+  profilePanelOpen.value = true;
+  await persist("新增方案已保存");
+  showProfileNotice(`已新增方案「${name}」。`);
+}
+
+async function removeProfile(index: number): Promise<void> {
+  const target = profiles.value[index];
+  if (!target) return;
+  const next: ButtonMappings = {
+    ...mappings.value,
+    mappingProfiles: profiles.value.filter((_, i) => i !== index),
+  };
+  mappings.value = next;
+  if (editingProfileIndex.value === index) editingProfileIndex.value = null;
+  if (profileKeyTarget.value?.index === index) profileKeyTarget.value = null;
+  await persist(`已删除方案「${target.name}」`);
+}
+
+function startEditProfile(index: number): void {
+  const p = profiles.value[index];
+  if (!p) return;
+  editingProfileIndex.value = index;
+  editedMatcher.value = {
+    processName: p.matcher.processName ?? "",
+    titleContains: p.matcher.titleContains ?? "",
+  };
+  profileFormError.value = null;
+}
+
+async function saveEditedProfile(index: number): Promise<void> {
+  const p = profiles.value[index];
+  if (!p) return;
+  profileFormError.value = null;
+  const processName = editedMatcher.value.processName.trim();
+  const titleContains = editedMatcher.value.titleContains.trim();
+  if (!processName && !titleContains) {
+    profileFormError.value = "请至少填写「进程名」或「窗口标题关键字」其一。";
+    return;
+  }
+  const nextProfiles = profiles.value.map((item, i) =>
+    i === index
+      ? {
+          ...item,
+          matcher: {
+            processName: processName || null,
+            titleContains: titleContains || null,
+          },
+        }
+      : item,
+  );
+  mappings.value = { ...mappings.value, mappingProfiles: nextProfiles };
+  editingProfileIndex.value = null;
+  await persist("方案匹配条件已更新");
+}
+
+/** 方案内按键覆盖动作摘要：未覆盖的键在其下方列出兜底「沿基础映射」。 */
+function profileActionSummary(actions: Partial<Record<RemoteButton, ButtonActions>>, button: RemoteButton): string {
+  const act = actions[button];
+  if (!act) return "沿用基础映射";
+  const first = act.single ?? act.double ?? act.long;
+  return first ? `覆盖 · ${actionSummary(first)}` : "已覆盖";
+}
+
+/** 给选中方案+按键写入一条覆盖动作（手动录入为 shortcut）。 */
+async function applyProfileChord(index: number, button: RemoteButton): Promise<void> {
+  profileChordError.value = null;
+  const p = profiles.value[index];
+  if (!p) return;
+  try {
+    const keys = parseManualChord(profileChordText.value);
+    const nextProfiles = profiles.value.map((item, i) =>
+      i === index
+        ? { ...item, actions: { ...item.actions, [button]: { single: { type: "shortcut", chord: { keys } } } } }
+        : item,
+    );
+    mappings.value = { ...mappings.value, mappingProfiles: nextProfiles };
+    profileChordText.value = "";
+    profileKeyTarget.value = null;
+    await persist(`已为「${buttonLabel(button)}」写入覆盖动作`);
+  } catch (error) {
+    profileChordError.value =
+      error instanceof ManualKeyError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : String(error);
+  }
+}
+
+/** 清除指定方案+按键的覆盖（回落基础映射）。 */
+async function clearProfileKey(index: number, button: RemoteButton): Promise<void> {
+  const p = profiles.value[index];
+  if (!p) return;
+  const rest: Partial<Record<RemoteButton, ButtonActions>> = { ...p.actions };
+  delete rest[button];
+  const nextProfiles = profiles.value.map((item, i) => (i === index ? { ...item, actions: rest } : item));
+  mappings.value = { ...mappings.value, mappingProfiles: nextProfiles };
+  if (profileKeyTarget.value?.index === index && profileKeyTarget.value.button === button) profileKeyTarget.value = null;
+  await persist(`已清除「${buttonLabel(button)}」的覆盖`);
+}
+
 async function persist(message?: string): Promise<void> {
   const request = ++saveRequest;
   const payload = JSON.parse(JSON.stringify(mappings.value)) as ButtonMappings;
@@ -1636,6 +1833,15 @@ onMounted(async () => {
   }
   unlistenGestures = stopGestures;
 
+  const stopProfile = await subscribeProfileChanged((active: string | null) => {
+    activeProfile.value = active;
+  });
+  if (unmounted) {
+    stopProfile();
+    return;
+  }
+  unlistenProfile = stopProfile;
+
   const stopShortcutCaptureEvents = await subscribeShortcutCaptureEdges(
     (edge: ShortcutCaptureEdge) => acceptCapturedKey(edge.key, edge.isPressed),
   );
@@ -2277,6 +2483,153 @@ onUnmounted(() => {
       </div>
     </footer>
 
+    <!-- #213 按前台应用切换方案（profile）管理 -->
+    <article class="card mapping-profiles">
+      <div class="profiles-head">
+        <button
+          class="profiles-toggle"
+          type="button"
+          :aria-expanded="profilePanelOpen"
+          @click="profilePanelOpen = !profilePanelOpen"
+        >
+          <span class="profiles-chevron" :class="{ open: profilePanelOpen }">›</span>
+          <span>按前台应用切换方案</span>
+          <small class="muted">根据当前前台窗口自动切换按键映射</small>
+        </button>
+        <span class="profiles-active" :class="activeProfile ? 'hit' : ''">
+          <span class="status-dot" :class="activeProfile ? 'success' : 'neutral'"></span>
+          {{ activeProfile ? `当前方案：${activeProfile}` : "当前方案：基础映射" }}
+        </span>
+      </div>
+
+      <div v-if="profilePanelOpen" class="profiles-body">
+        <p class="muted profiles-desc">
+          每个方案包含「前台窗口匹配规则」和「按键覆盖」。前台窗口命中方案时使用该方案的按键覆盖；
+          未被任何方案覆盖的按键沿用基础映射。方案按上到下顺序匹配，首个命中生效。
+        </p>
+
+        <!-- 新增方案 -->
+        <div class="profiles-add">
+          <input
+            v-model="newProfileForm.name"
+            class="profiles-input"
+            type="text"
+            placeholder="方案名称（如：浏览器）"
+            :disabled="busy"
+          />
+          <input
+            v-model="newProfileForm.processName"
+            class="profiles-input"
+            type="text"
+            placeholder="进程名关键字，如 chrome.exe"
+            :disabled="busy"
+          />
+          <input
+            v-model="newProfileForm.titleContains"
+            class="profiles-input"
+            type="text"
+            placeholder="窗口标题关键字（可空）"
+            :disabled="busy"
+          />
+          <button class="secondary-button" type="button" :disabled="busy" @click="addProfile">
+            新增方案
+          </button>
+        </div>
+        <p v-if="profileFormError" class="error-text profiles-error">{{ profileFormError }}</p>
+
+        <div v-if="profiles.length === 0" class="muted profiles-empty">
+          还没有任何方案。定义一个方案后，在前台启动对应应用即可自动切换。
+        </div>
+
+        <div v-for="(profile, index) in profiles" :key="profile.name + index" class="profiles-item">
+          <div class="profiles-item-head">
+            <strong class="profiles-name">{{ profile.name }}</strong>
+            <span class="muted profiles-matcher">
+              {{ profile.matcher.processName ?? "任意进程" }}
+              <template v-if="profile.matcher.processName && profile.matcher.titleContains"> · </template>
+              {{ profile.matcher.titleContains ? `标题含「${profile.matcher.titleContains}」` : "任意标题" }}
+            </span>
+            <span class="profiles-item-actions">
+              <button class="text-button" type="button" :disabled="busy" @click="startEditProfile(index)">
+                编辑匹配
+              </button>
+              <button class="text-button danger" type="button" :disabled="busy" @click="removeProfile(index)">
+                删除
+              </button>
+            </span>
+          </div>
+
+          <div v-if="editingProfileIndex === index" class="profiles-edit-matcher">
+            <input
+              v-model="editedMatcher.processName"
+              class="profiles-input"
+              type="text"
+              placeholder="进程名关键字（可空）"
+            />
+            <input
+              v-model="editedMatcher.titleContains"
+              class="profiles-input"
+              type="text"
+              placeholder="窗口标题关键字（可空）"
+            />
+            <button class="secondary-button" type="button" :disabled="busy" @click="saveEditedProfile(index)">
+              保存
+            </button>
+            <button class="text-button" type="button" :disabled="busy" @click="editingProfileIndex = null">
+              取消
+            </button>
+          </div>
+          <p v-if="editingProfileIndex === index && profileFormError" class="error-text">{{ profileFormError }}</p>
+
+          <!-- 按键覆盖列表 -->
+          <div class="profiles-keys">
+            <button
+              v-for="button in PROFILE_BUTTONS"
+              :key="button"
+              class="chip profiles-key"
+              :class="{ overridden: !!profile.actions[button] }"
+              type="button"
+              :title="profileActionSummary(profile.actions, button)"
+              :disabled="busy"
+              @click="profileKeyTarget = profileKeyTarget?.index === index && profileKeyTarget.button === button ? null : { index, button }"
+            >
+              {{ buttonLabel(button) }}
+            </button>
+          </div>
+
+          <div v-if="profileKeyTarget && profileKeyTarget.index === index" class="profiles-keys-edit">
+            <span class="muted">给「{{ buttonLabel(profileKeyTarget.button) }}」设覆盖动作：</span>
+            <input
+              v-model="profileChordText"
+              class="profiles-input"
+              type="text"
+              placeholder="如 ctrl+win+f13（manual key / 修饰键）"
+              @keydown.enter="applyProfileChord(index, profileKeyTarget.button)"
+            />
+            <button
+              class="secondary-button"
+              type="button"
+              :disabled="busy || !profileChordText.trim()"
+              @click="applyProfileChord(index, profileKeyTarget.button)"
+            >
+              写入快捷键
+            </button>
+            <button
+              v-if="profile.actions[profileKeyTarget.button]"
+              class="text-button danger"
+              type="button"
+              :disabled="busy"
+              @click="clearProfileKey(index, profileKeyTarget.button)"
+            >
+              清除覆盖
+            </button>
+            <p v-if="profileChordError" class="error-text">{{ profileChordError }}</p>
+          </div>
+        </div>
+      </div>
+    </article>
+
+    <p v-if="profileNotice" class="operation-message mapping-status">{{ profileNotice }}</p>
     <p v-if="statusMessage" class="operation-message mapping-status">{{ statusMessage }}</p>
     <p v-if="mappingSnapshot?.lastError" class="error-text">{{ mappingSnapshot.lastError }}</p>
     <RegisteredAppsDialog v-if="appPickerOpen" :known-apps="mappings.applications ?? []" :saving="busy" :save-error="appPickerError" @close="appPickerOpen = false" @add="addScannedApps" />
@@ -2319,4 +2672,36 @@ onUnmounted(() => {
 .manual-entry-inputs input { width: min(280px, 100%); box-sizing: border-box; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid #888; border-radius: 4px; }
 .manual-entry-inputs input:focus { outline: none; border-color: var(--brand, currentColor); }
 .manual-entry-error { margin: 0; font-size: 12px; }
+/* #213 按前台应用切换方案（profile）管理。 */
+.mapping-profiles { margin-top: 14px; padding: 12px 16px; }
+.profiles-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.profiles-toggle { display: inline-flex; align-items: baseline; gap: 8px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+.profiles-toggle small { font-size: 12px; margin-left: 6px; }
+.profiles-chevron { display: inline-block; transition: transform 0.2s ease; color: var(--muted); font-size: 17px; line-height: 1; }
+.profiles-chevron.open { transform: rotate(90deg); }
+.profiles-active { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.profiles-active.hit { color: var(--text-primary); }
+.status-dot.neutral { background: var(--dot-pending); }
+.profiles-body { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+.profiles-desc { margin: 0 0 12px; font-size: 12.5px; line-height: 1.6; }
+.profiles-add { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.profiles-input { width: min(200px, 100%); box-sizing: border-box; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid var(--border-strong); border-radius: 4px; }
+.profiles-input:focus { outline: none; border-color: var(--brand, currentColor); }
+.profiles-error { margin: 8px 0 0; }
+.profiles-empty { margin: 12px 0 0; font-size: 13px; }
+.profiles-item { margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; }
+.profiles-item-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.profiles-name { font-size: 14px; }
+.profiles-matcher { font-size: 12.5px; }
+.profiles-item-actions { margin-left: auto; display: inline-flex; gap: 10px; }
+.text-button { padding: 0; border: 0; background: none; color: var(--accent-text, currentColor); font: inherit; font-size: 12.5px; cursor: pointer; }
+.text-button:hover { text-decoration: underline; }
+.text-button:disabled { cursor: not-allowed; opacity: 0.55; }
+.text-button.danger { color: var(--dot-error); }
+.profiles-edit-matcher { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.profiles-keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.profiles-key { min-height: 28px; font-size: 12.5px; }
+.profiles-key.overridden { border-color: var(--accent-border); background: var(--accent-surface); color: var(--accent-text); font-weight: 600; }
+.profiles-keys-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.profiles-keys-edit .profiles-input { width: min(300px, 100%); }
 </style>

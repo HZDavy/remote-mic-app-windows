@@ -247,6 +247,24 @@ export interface ButtonMappings {
   applications?: CustomAppPick[];
   /** 聚焦档案：键 = `open_app` 的 target（预设 id 或自定义应用路径）。 */
   focusProfiles?: Record<string, AppFocusProfile>;
+  /** 按前台应用切换的映射方案（#213）：顺序匹配，首个命中生效，未命中用基础 actions。 */
+  mappingProfiles?: MappingProfile[];
+}
+
+/** 前台窗口匹配规则：至少给定「进程名」或「窗口标题关键字」其一（否则配置不允许保存）。 */
+export interface WindowMatcher {
+  /** 前台进程名（不区分大小写）；`null` = 不约束进程。 */
+  processName?: string | null;
+  /** 前台窗口标题需包含的子串（不区分大小写）；`null` = 不约束标题。 */
+  titleContains?: string | null;
+}
+
+/** 单条按前台应用切换的快捷键映射方案。 */
+export interface MappingProfile {
+  name: string;
+  matcher: WindowMatcher;
+  /** 逐键覆盖基础 actions（未覆盖的键回落基础映射）。 */
+  actions: Partial<Record<RemoteButton, ButtonActions>>;
 }
 
 export interface FiredGesture {
@@ -274,6 +292,8 @@ export interface ButtonMappingSnapshot {
   lastFired: FiredGesture | null;
   lastError: string | null;
   lastFocus?: FocusReport;
+  /** 当前前台命中的 profile 名；`null` = 回落基础映射（或尚未采样到前台）。 */
+  activeProfile?: string | null;
 }
 
 export interface SendInputSnapshot {
@@ -985,6 +1005,22 @@ export async function subscribeButtonGestures(
   }
   const { listen } = await import("@tauri-apps/api/event");
   const unlisten = await listen<FiredGesture>("button-gesture", (event) => handler(event.payload));
+  return () => {
+    void unlisten();
+  };
+}
+
+/** 订阅前台应用 profile 切换（`Some(名)`=命中，`null`=回落基础映射）；浏览器预览下为空订阅。 */
+export async function subscribeProfileChanged(
+  handler: (activeProfile: string | null) => void,
+): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<string | null>("mapping-profile-changed", (event) =>
+    handler(event.payload),
+  );
   return () => {
     void unlisten();
   };
