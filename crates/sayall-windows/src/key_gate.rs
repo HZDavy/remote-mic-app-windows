@@ -216,6 +216,21 @@ pub fn capture_key_code(vk_code: u32, make_code: u16, extended: bool) -> Option<
             KeyCode::F11,
             KeyCode::F12,
         ][(vk_code - 0x70) as usize],
+        // F13-F24（VK 0x7C-0x87）：键盘常无实物，靠手动录入文本（#215）。
+        0x7C..=0x87 => [
+            KeyCode::F13,
+            KeyCode::F14,
+            KeyCode::F15,
+            KeyCode::F16,
+            KeyCode::F17,
+            KeyCode::F18,
+            KeyCode::F19,
+            KeyCode::F20,
+            KeyCode::F21,
+            KeyCode::F22,
+            KeyCode::F23,
+            KeyCode::F24,
+        ][(vk_code - 0x7C) as usize],
         0xA0 => KeyCode::LeftShift,
         0xA1 => KeyCode::RightShift,
         0xA2 => KeyCode::LeftControl,
@@ -1050,6 +1065,22 @@ pub(crate) fn lock_gate_tests() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     #[cfg(windows)]
     use super::*;
+
+    #[test]
+    fn capture_protocol_maps_f13_to_f24_virtual_keys() {
+        // #215：0x7C-0x87 的 VK 全部落到 F13-F24。
+        for (vk, expected) in [
+            (0x7C, KeyCode::F13),
+            (0x7E, KeyCode::F15),
+            (0x80, KeyCode::F17),
+            (0x82, KeyCode::F19),
+            (0x84, KeyCode::F21),
+            (0x86, KeyCode::F23),
+            (0x87, KeyCode::F24),
+        ] {
+            assert_eq!(capture_key_code(vk, 0, false), Some(expected), "VK 0x{vk:X}");
+        }
+    }
 
     #[test]
     fn capture_protocol_preserves_sided_modifiers_and_letters() {

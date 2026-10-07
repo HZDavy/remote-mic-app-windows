@@ -109,6 +109,20 @@ pub enum KeyCode {
     F10,
     F11,
     F12,
+    /// F13-F24：多数键盘物理上没有，无法直接录制（见 #215）。
+    /// 通过手动录入文本（如 `f13`）触发，走虚拟键路径注入。
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+    F21,
+    F22,
+    F23,
+    F24,
     /// `~ 键（VK_OEM_3）。遥控器 TV 键的原生等价键：TV usage 0x0035 在
     /// Windows 键盘映射里就是 OEM_3，被吞后必须能按原样回注。
     Oem3,
@@ -186,6 +200,18 @@ impl KeyCode {
             Self::F10 => 0x79,
             Self::F11 => 0x7A,
             Self::F12 => 0x7B,
+            Self::F13 => 0x7C,
+            Self::F14 => 0x7D,
+            Self::F15 => 0x7E,
+            Self::F16 => 0x7F,
+            Self::F17 => 0x80,
+            Self::F18 => 0x81,
+            Self::F19 => 0x82,
+            Self::F20 => 0x83,
+            Self::F21 => 0x84,
+            Self::F22 => 0x85,
+            Self::F23 => 0x86,
+            Self::F24 => 0x87,
             Self::LeftShift => 0xA0,
             Self::RightShift => 0xA1,
             Self::LeftControl => 0xA2,
@@ -1384,6 +1410,29 @@ mod tests {
             KeyCode::RightShift.physical_scan_code(),
             Some((0x36, false))
         );
+    }
+
+    #[test]
+    fn f13_to_f24_map_to_virtual_keys_and_have_no_set1_scan_code() {
+        // #215：多数键盘没有 F13-F24 实体，无法录制，走虚拟键路径注入。
+        for (key, vk) in [
+            (KeyCode::F13, 0x7C),
+            (KeyCode::F14, 0x7D),
+            (KeyCode::F15, 0x7E),
+            (KeyCode::F16, 0x7F),
+            (KeyCode::F17, 0x80),
+            (KeyCode::F18, 0x81),
+            (KeyCode::F19, 0x82),
+            (KeyCode::F20, 0x83),
+            (KeyCode::F21, 0x84),
+            (KeyCode::F22, 0x85),
+            (KeyCode::F23, 0x86),
+            (KeyCode::F24, 0x87),
+        ] {
+            assert_eq!(key.virtual_key(), vk, "VK 偏移必须连续可推算");
+            // PS/2 Set 1 没有 F13-F24 的标准扫描码，应退回虚拟键注入。
+            assert_eq!(key.physical_scan_code(), None);
+        }
     }
 
     #[test]
